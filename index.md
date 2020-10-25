@@ -188,24 +188,29 @@ class Reader:
     """
 
     def __init__(self, config, mode='train', places=None):
+    		#读取yaml文件中 TRAIN 下的所有参数设置
         try:
             self.params = config[mode.upper()]
         except KeyError:
             raise ModeException(mode=mode)
-
+			
+        # 设置是否使用mixup、读取器模式（train还是valid、test）、是否fhuffle
         use_mix = config.get('use_mix')
         self.params['mode'] = mode
         self.shuffle = mode == "train"
-
+			
+        # 设置是否进行batch规模的数据处理（为了使用mixup）
         self.collate_fn = None
         self.batch_ops = []
         if use_mix and mode == "train":
             self.batch_ops = create_operators(self.params['mix'])
             self.collate_fn = self.mix_collate_fn
 
+			# 在cpu还是gpu上执行
         self.places = places
 
     def mix_collate_fn(self, batch):
+    	  # 进行样本规模的数据增广（针对单个样本进行变形、遮挡、加噪等处理）和标准化处理
         batch = transform(batch, self.batch_ops)
         # batch each field
         slots = []
@@ -219,10 +224,13 @@ class Reader:
         return [np.stack(slot, axis=0) for slot in slots]
 
     def __call__(self):
+    		# 设定分布式训练下的batch_size
         batch_size = int(self.params['batch_size']) // trainers_num
-
+        
+			# 定义数据集对象
         dataset = CommonDataset(self.params)
 
+			# 根据模式参数的设定（train还是valid或test等其他模式），定义loader对象
         if self.params['mode'] == "train":
             batch_sampler = DistributedBatchSampler(
                 dataset,
@@ -255,11 +263,242 @@ Reader类源码解析：
 
 python中类似于重载括号的__call__（）方法可以是类对象像函数一样被使用，所以Reader的__call__（）函数的作用就是输出一个batch的数据。首先将通过继承DataSet类创建的CommonDataset()类来创建数据集对象dataset，然后用DataLoader类创建loader对象并将其返回。如果在训练模型下loader对象将由DistributedBatchSampler类创建的batch_sampler对象创建，用于分布式载入数据。如果是非训练模式，则直接用dataset对象创建普通载入器。
 
-......
 
 ### 2）训练流程
 
-......
+上面数据处理流程里提到过，我们通过执行 python -m paddle.distributed.launch 调用tools 文件夹下的 train.py 脚本来启动训练流程。train.py脚本中一共有两个函数。parse_args()用于解析train脚本的参数（不是paddle.distributed.launch 的参数）。main()则负责训练过程。主要处理包括（train）参数解析、并行设置、模型定义、优化设置（包括学习率超参）、模型读取、数据loader定义、验证过程设定和训练主循环过程。训练主循环过程主要由训练和验证过程、top1记录和模型保存、定期模型保存、日志保存四个部分组成。
+
+下面看下 train.py 的代码：
+
+```
+# 参数解析函数
+def parse_args():
+    parser = argparse.ArgumentParser("PaddleClas train script")
+    # 添加设置yaml配置文件的参数
+    parser.add_argument(
+        '-c',
+        '--config',
+        type=str,
+        default='configs/ResNet/ResNet50.yaml',
+        help='config file path')
+    # 添加设置其他操作（比如是否使用mixup的“use_mix=1”）的参数
+    parser.add_argument(
+        '-o',
+        '--override',
+        action='append',
+        default=[],
+        help='config options to be overridden')
+    args = parser.parse_args()
+    return args
+
+
+def main(args):
+	  # 将yaml配置文件（args.config中）的信息，与手动高优先级设置（args.override）的参数读取到config对象中
+    config = get_config(args.config, overrides=args.override, show=True)
+    # 设置cpu还是gpu运行，gpu上分布式运行
+    use_gpu = config.get("use_gpu", True)
+    if use_gpu:
+        gpu_id = ParallelEnv().dev_id
+        place = paddle.CUDAPlace(gpu_id)
+    else:
+        place = paddle.CPUPlace()
+
+    use_data_parallel = int(os.getenv("PADDLE_TRAINERS_NUM", 1)) != 1
+    config["use_data_parallel"] = use_data_parallel
+	  # Paddle2.0beta版需要这一句设定Paddle在动态图模式下运行。正式版本中动态图模式为默认模式，无需加这一句。
+    paddle.disable_static(place)
+	
+    # 建立训练使用的模型对象，config.ARCHITECTURE 指定模型结构（如resnet50_vd), config.classes_num 指定分类数量
+    net = program.create_model(config.ARCHITECTURE, config.classes_num)
+
+		# 设定模型训练使用的优化器、学习率超参数
+    optimizer, lr_scheduler = program.create_optimizer(
+        config, parameter_list=net.parameters())
+
+		# 如果启用并行训练模式，模型net的定义也要相应处理，使模型依据channel的分配并行读取数据并进行训练
+    if config["use_data_parallel"]:
+        strategy = paddle.distributed.init_parallel_env()
+        net = paddle.DataParallel(net, strategy)
+
+    # 读取断点或预训练模型
+    init_model(config, net, optimizer)
+
+	  # 定义数据读取器
+    train_dataloader = Reader(config, 'train', places=place)()
+
+    # 如果模型训练设置了验证集，定义验证集读取器
+    if config.validate and ParallelEnv().local_rank == 0:
+        valid_dataloader = Reader(config, 'valid', places=place)()
+	  # 初始化最佳准确率及其batch轮数
+    best_top1_acc = 0.0  # best top1 acc record
+    best_top1_epoch = 0
+    # 开始逐epoch的训练循环
+    for epoch_id in range(config.epochs):
+    		# 设置模型为训练模型（优化考虑）
+        net.train()
+        # 通过封装在 program 对象 run 方法执行训练过程
+        program.run(train_dataloader, config, net, optimizer, lr_scheduler,
+                    epoch_id, 'train')
+                    
+		   # 没有设置并行使用数据读取或使用并行的情况下在0号线程下执行验证集预测和模型存储操作
+        if not config["use_data_parallel"] or ParallelEnv().local_rank == 0:
+            # 设置了进行验证参数（config.validate = True）并且处于验证epoch执行时进行验证集预测和模型保存
+            if config.validate and epoch_id % config.valid_interval == 0:
+            		# 设置模型为验证模式（优化考虑）
+                net.eval()
+                # 通过封装在 program 对象 run 方法执行验证过程
+                top1_acc = program.run(valid_dataloader, config, net, None,
+                                       None, epoch_id, 'valid')
+                                       
+                # 如果本epoch准确率好于历史最高值，保存当前epoch的准曲率与模型，并打印输出、保存日志
+                if top1_acc > best_top1_acc:
+                    best_top1_acc = top1_acc
+                    best_top1_epoch = epoch_id
+                    if epoch_id % config.save_interval == 0:
+                        model_path = os.path.join(config.model_save_dir,
+                                                  config.ARCHITECTURE["name"])
+                        save_model(net, optimizer, model_path, "best_model")
+                message = "The best top1 acc {:.5f}, in epoch: {:d}".format(
+                    best_top1_acc, best_top1_epoch)
+                logger.info("{:s}".format(logger.coloring(message, "RED")))
+
+            # 按设定的epoch保存间隔定期保存模型
+            if epoch_id % config.save_interval == 0:
+                model_path = os.path.join(config.model_save_dir,
+                                          config.ARCHITECTURE["name"])
+                save_model(net, optimizer, model_path, epoch_id)
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    main(args)
+```
+
+上面的 train.py 脚本的代码都有了比较详细的注释，训练过程也进行了理顺。下面我们就介绍 program 脚本及其中最主要的 run（）函数。train脚本中的训练、验证过程都是通过这个program.run()函数实现的。它也是模型训练过程的核心处理函数。
+
+我们来看一下 tools 文件夹下的 program.py 脚本。这个脚本里有较多函数。执行训练函数是run()，其它函数都是对run()函数训练模型过程中一些操作的封住。所以，我们先从run()函数开始理清执行流程，需要的情况下，对其他函数的细节进行展开讨论。
+
+run()函数的模型训练流程大致是这样的：
+
+下面看run()函数的代码：
+
+```
+def run(dataloader,
+        config,
+        net,
+        optimizer=None,
+        lr_scheduler=None,
+        epoch=0,
+        mode='train'):
+    """
+    Feed data to the model and fetch the measures and loss
+
+    Args:
+        dataloader(paddle dataloader):
+        exe():
+        program():
+        fetchs(dict): dict of measures and the loss
+        epoch(int): epoch of training or validation
+        model(str): log only
+
+    Returns:
+    """
+    print_interval = config.get("print_interval", 10)
+    use_mix = config.get("use_mix", False) and mode == "train"
+
+    metric_list = [
+        ("loss", AverageMeter('loss', '7.5f')),
+        ("lr", AverageMeter(
+            'lr', 'f', need_avg=False)),
+        ("batch_time", AverageMeter('elapse', '.7f')),
+        ("reader_time", AverageMeter('reader ', '.7f')),
+    ]
+    if not use_mix:
+        topk_name = 'top{}'.format(config.topk)
+        metric_list.insert(1, (topk_name, AverageMeter(topk_name, '.5f')))
+        metric_list.insert(1, ("top1", AverageMeter("top1", '.5f')))
+
+    metric_list = OrderedDict(metric_list)
+
+    tic = time.time()
+    for idx, batch in enumerate(dataloader()):
+        metric_list['reader_time'].update(time.time() - tic)
+        batch_size = len(batch[0])
+        feeds = create_feeds(batch, use_mix)
+        fetchs = create_fetchs(feeds, net, config, mode)
+        if mode == 'train':
+            if config["use_data_parallel"]:
+                avg_loss = net.scale_loss(fetchs['loss'])
+                avg_loss.backward()
+                net.apply_collective_grads()
+            else:
+                avg_loss = fetchs['loss']
+                avg_loss.backward()
+
+            optimizer.minimize(avg_loss)
+            net.clear_gradients()
+            metric_list['lr'].update(
+                optimizer._global_learning_rate().numpy()[0], batch_size)
+
+            if lr_scheduler is not None:
+                if lr_scheduler.update_specified:
+                    curr_global_counter = lr_scheduler.step_each_epoch * epoch + idx
+                    update = max(
+                        0, curr_global_counter - lr_scheduler.update_start_step
+                    ) % lr_scheduler.update_step_interval == 0
+                    if update:
+                        lr_scheduler.step()
+                else:
+                    lr_scheduler.step()
+
+        for name, fetch in fetchs.items():
+            metric_list[name].update(fetch.numpy()[0], batch_size)
+        metric_list['batch_time'].update(time.time() - tic)
+        tic = time.time()
+
+        fetchs_str = ' '.join([str(m.value) for m in metric_list.values()])
+
+        if idx % print_interval == 0:
+            if mode == 'eval':
+                logger.info("{:s} step:{:<4d} {:s}s".format(mode, idx,
+                                                            fetchs_str))
+            else:
+                epoch_str = "epoch:{:<3d}".format(epoch)
+                step_str = "{:s} step:{:<4d}".format(mode, idx)
+                logger.info("{:s} {:s} {:s}s".format(
+                    logger.coloring(epoch_str, "HEADER")
+                    if idx == 0 else epoch_str,
+                    logger.coloring(step_str, "PURPLE"),
+                    logger.coloring(fetchs_str, 'OKGREEN')))
+
+    end_str = ' '.join([str(m.mean) for m in metric_list.values()] +
+                       [metric_list['batch_time'].total])
+    if mode == 'eval':
+        logger.info("END {:s} {:s}s".format(mode, end_str))
+    else:
+        end_epoch_str = "END epoch:{:<3d}".format(epoch)
+
+        logger.info("{:s} {:s} {:s}s".format(
+            logger.coloring(end_epoch_str, "RED"),
+            logger.coloring(mode, "PURPLE"),
+            logger.coloring(end_str, "OKGREEN")))
+
+    # return top1_acc in order to save the best model
+    if mode == 'valid':
+        return metric_list['top1'].avg
+
+```
+
+对于上面代码中一些操作的封装函数，PaddleClas的源码都对函数的参数、功能做了较为详细的注释，需要注意或展开的有以下几个地方：
+
+* 1. create_loss()函数计算模型loss时，如果采用了蒸馏方法，需要计算老师模型和学生模型输出标签的JS散度，这是PaddleClas特有的，和普通蒸馏技术使用软标签不同。
+
+* 1. 如果是训练过程并使用了mixup数据增强，注意数据样本要用两个样本按比例混合生成新样本处理。
+
+* 1. 如果是训练过程并使用了分布式训练，数据读取、loss计算等操作要按分布式任务做分配、加和处理。
+
+* 1. create_optimizer() 函数中的 LearningRateBuilder() 和 OptimizerBuilder（）封装在 ppcls/optimizer 文件夹下的包里，我们展开讲一下。
+
 
 ### 3）预测流程
 
