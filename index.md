@@ -491,13 +491,13 @@ def run(dataloader,
 
 对于上面代码中一些操作的封装函数，PaddleClas的源码都对函数的参数、功能做了较为详细的注释，需要注意或展开的有以下几个地方：
 
-* 1. create_loss()函数计算模型loss时，如果采用了蒸馏方法，需要计算老师模型和学生模型输出标签的JS散度，这是PaddleClas特有的，和普通蒸馏技术使用软标签不同。
+*  create_loss()函数计算模型loss时，如果采用了蒸馏方法，需要计算老师模型和学生模型输出标签的JS散度，这是PaddleClas特有的，和普通蒸馏技术使用软标签不同。
 
-* 1. 如果是训练过程并使用了mixup数据增强，注意数据样本要用两个样本按比例混合生成新样本处理。
+*  如果是训练过程并使用了mixup数据增强，注意数据样本要用两个样本按比例混合生成新样本处理。
 
-* 1. 如果是训练过程并使用了分布式训练，数据读取、loss计算等操作要按分布式任务做分配、加和处理。
+*  如果是训练过程并使用了分布式训练，数据读取、loss计算等操作要按分布式任务做分配、加和处理。
 
-* 1. create_optimizer() 函数中的 LearningRateBuilder() 和 OptimizerBuilder（）封装在 ppcls/optimizer 文件夹下的包里，我们展开讲一下。
+*  create_optimizer() 函数中的 LearningRateBuilder() 和 OptimizerBuilder（）封装在 ppcls/optimizer 文件夹下的包里，我们展开讲一下。
 
 
 ### 3）预测流程
